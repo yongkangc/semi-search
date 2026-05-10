@@ -131,6 +131,212 @@ Agent context builder
 - Feedback and observability loop
 - Trust, provenance, and citation layer
 
+
+## Focus area: retrieval storage and low-latency serving
+
+The next major work should focus on points **5** and **6** from the architecture plan:
+
+5. **Store vectors and keyword indexes in retrieval systems**
+6. **Serve low-latency queries with filters, ranking, and reranking**
+
+This is the core of Semi Search. Crawling creates the corpus, but retrieval quality is the product.
+
+### What is done
+
+Current v0 has a thin end-to-end slice:
+
+- seed-based fixture/local/HTTP fetch
+- basic HTML/plain-text parsing
+- basic cleaning
+- overlapping word chunks
+- JSONL chunk store
+- Tantivy/BM25 keyword index
+- CLI search over the keyword index
+- cited JSON results with title, URL, snippet, score, and source
+- integration test for crawl → chunk → index → search
+
+Current query path:
+
+```text
+query -> Tantivy BM25 -> top-k chunks -> JSON cited results
+```
+
+### What is left
+
+The retrieval core still needs:
+
+- vector embeddings for every chunk
+- vector DB/index for semantic search
+- hybrid retrieval: BM25 + vector search
+- metadata filters: company, source type, domain, date, topic
+- score normalization across BM25 and vector scores
+- candidate merging and deduplication
+- reranking layer
+- source-quality and freshness scoring
+- compact query-specific highlights
+- latency benchmarks
+- evaluation harness tied to real semiconductor research queries
+
+### Vector DB direction
+
+Do **not** build a custom vector DB first.
+
+Start with a swappable vector-index interface:
+
+```rust
+trait VectorIndex {
+    fn upsert_chunks(&self, chunks: &[EmbeddedChunk]) -> Result<()>;
+    fn search(&self, query_embedding: &[f32], filters: SearchFilters, top_k: usize) -> Result<Vec<VectorHit>>;
+}
+```
+
+Then use a proven backend for v1:
+
+- **Qdrant** if we want a service-oriented vector DB with filtering and HNSW built in
+- **LanceDB** if we want local embedded storage and easy iteration
+- **hnswlib/faiss-style embedded index later** if we want to learn/build retrieval internals ourselves
+
+Recommendation for now: **Qdrant first**, behind a Rust trait.
+
+Why:
+
+- good metadata filtering
+- production-shaped architecture
+- easy local Docker setup
+- lets us focus on hybrid retrieval and ranking instead of vector storage internals
+- can be replaced later if we want custom retrieval systems
+
+### Retrieval architecture
+
+```mermaid
+flowchart TD
+    subgraph Offline[Offline indexing path]
+        A[Seed sources
+NVIDIA / AMD / TSMC / SemiAnalysis / Substack] --> B[Quick crawler]
+        B --> C[Parser + cleaner]
+        C --> D[Chunker]
+        D --> E[Chunk store
+JSONL / future SQLite or object store]
+        E --> F[Embedding worker]
+        E --> G[BM25 indexer
+Tantivy]
+        F --> H[Vector DB
+Qdrant or LanceDB]
+        G --> I[Keyword index
+Tantivy]
+    end
+
+    subgraph Online[Online query path]
+        Q[User / agent query] --> QR[Query parser + rewrite]
+        QR --> K[BM25 retrieval]
+        QR --> V[Vector retrieval]
+        I --> K
+        H --> V
+        K --> M[Candidate merge]
+        V --> M
+        M --> FIL[Metadata filters
+company / source / date / topic]
+        FIL --> R[Reranker
+heuristics first, model later]
+        R --> S[Snippet + highlight extractor]
+        S --> OUT[Agent context JSON
+citations + why relevant]
+    end
+
+    subgraph Eval[Evaluation loop]
+        OUT --> EV[Golden queries + task evals]
+        EV --> R
+        EV --> QR
+        EV --> E
+    end
+```
+
+### Target query serving flow
+
+```text
+query
+  -> parse intent and filters
+  -> embed query
+  -> BM25 top 100
+  -> vector top 100
+  -> merge candidates
+  -> apply metadata filters
+  -> deduplicate near-identical chunks
+  -> rerank top 50
+  -> extract query-specific highlights
+  -> return top 10 cited agent-context results
+```
+
+### Ranking model v1
+
+Start with transparent heuristic scoring:
+
+```text
+final_score =
+  0.30 * bm25_score_normalized
++ 0.30 * vector_score_normalized
++ 0.10 * title_match
++ 0.10 * company_tag_match
++ 0.10 * source_quality
++ 0.05 * freshness
++ 0.05 * diversity_penalty_adjustment
+```
+
+This is easier to debug than an opaque model. Once we collect evals and feedback, add a learned reranker or LLM/cross-encoder reranking pass.
+
+### Search filters v1
+
+The API should support filters early:
+
+```json
+{
+  "query": "TSMC CoWoS capacity constraints",
+  "companies": ["TSMC", "NVIDIA", "AMD"],
+  "source_types": ["company", "analysis", "substack", "news"],
+  "domains": ["semianalysis.com"],
+  "published_after": "2024-01-01",
+  "topics": ["advanced_packaging", "ai_accelerators"]
+}
+```
+
+For semiconductor research, filters are not a nice-to-have. They are how we separate company docs, market commentary, architecture notes, and stale news.
+
+### Next implementation milestones
+
+1. Add metadata-rich chunk schema
+   - company tags
+   - source type
+   - domain
+   - published/updated date
+   - topic tags
+
+2. Add embedding pipeline
+   - generate embeddings for chunks
+   - store embedding model/version
+   - support re-embedding
+
+3. Add vector index backend
+   - implement `VectorIndex` trait
+   - start with Qdrant or LanceDB
+   - add local dev setup
+
+4. Build hybrid search
+   - BM25 + vector retrieval
+   - candidate merge
+   - filters
+   - score normalization
+
+5. Add reranking
+   - heuristic reranker first
+   - source/freshness/diversity signals
+   - learned reranker later
+
+6. Add evals and latency benchmarks
+   - recall@5 / recall@10
+   - MRR / NDCG
+   - query latency p50/p95
+   - downstream research usefulness
+
 ## Rust-first direction
 
 The project should be Rust-first for performance, reliability, and eventual scale.
