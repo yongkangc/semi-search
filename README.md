@@ -41,6 +41,18 @@ This is not just a vector database. It is a full retrieval system:
 5. expose agent-friendly search APIs
 6. evaluate search quality continuously
 
+
+## Build order
+
+The first milestone is a quick crawler that produces useful chunks, not a full-scale crawler.
+
+1. **Quick crawl to chunks** — seed sources, fetch pages, parse text, chunk documents, and create a local chunk store.
+2. **Retrieval core** — build BM25 + vector indexes, hybrid retrieval, filters, ranking, and reranking.
+3. **Agent-first context** — expose compact cited results that agents can consume directly.
+4. **Evaluation loop** — measure search quality through golden queries and downstream research usefulness.
+
+Most engineering depth should go into the retrieval core: index design, low-latency query serving, filters, ranking, reranking, citations, and evals. The crawler should stay simple until the retrieval loop works.
+
 ## Prototype scope
 
 The first prototype should be deliberately small and useful:
