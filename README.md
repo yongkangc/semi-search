@@ -1,5 +1,8 @@
 # semi-search
 
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/a24f0127-f4b3-47f4-a82a-00fdcbd4f9af" />
+
+
 Semi Search: agent-first search for semiconductor research.
 
 The goal is to build an agent-first search engine, in Rust, optimized for coding agents, research agents, and semiconductor fundamental investing workflows. Instead of generic web search, this project focuses on retrieving high-signal semiconductor context: company filings, product architecture notes, technical blogs, industry analysis, news, and supply-chain commentary.
