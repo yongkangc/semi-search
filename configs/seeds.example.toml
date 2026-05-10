@@ -3,6 +3,7 @@
 output_jsonl = "../data/chunks.jsonl"
 chunk_tokens = 70
 chunk_overlap = 12
+max_pages = 10
 
 [[seeds]]
 url = "https://example.com/semiconductor/nvidia-blackwell"
