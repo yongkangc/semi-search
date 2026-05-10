@@ -76,7 +76,7 @@ pub struct Chunk {
     pub metadata: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct SearchResult {
     pub chunk_id: String,
     pub title: String,
@@ -99,6 +99,53 @@ pub struct ScoreComponents {
     pub vector: f32,
     pub vector_normalized: f32,
     pub final_score: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EvalQuery {
+    pub id: String,
+    pub query: String,
+    #[serde(default)]
+    pub expected_companies: Vec<String>,
+    #[serde(default)]
+    pub expected_topics: Vec<String>,
+    #[serde(default)]
+    pub expected_domains: Vec<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalReport {
+    pub query_count: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub recall_like_filter_match: f32,
+    pub results: Vec<EvalQueryResult>,
+    pub failures: Vec<EvalFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalQueryResult {
+    pub id: String,
+    pub query: String,
+    pub matched: bool,
+    pub result_count: usize,
+    pub top_titles: Vec<String>,
+    pub matched_companies: Vec<String>,
+    pub matched_topics: Vec<String>,
+    pub matched_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalFailure {
+    pub id: String,
+    pub query: String,
+    pub reason: String,
+    pub expected_companies: Vec<String>,
+    pub expected_topics: Vec<String>,
+    pub expected_domains: Vec<String>,
+    pub top_titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1190,6 +1237,88 @@ pub fn search_index(
     search_index_with_filters(index_dir, query_text, limit, &SearchFilters::default())
 }
 
+pub fn evaluate_queries(
+    queries_path: impl AsRef<Path>,
+    index_dir: impl AsRef<Path>,
+    limit: usize,
+) -> Result<EvalReport> {
+    let queries: Vec<EvalQuery> = storage::read_jsonl(queries_path)?;
+    let index_dir = index_dir.as_ref().to_path_buf();
+    let mut results = Vec::with_capacity(queries.len());
+    let mut failures = Vec::new();
+
+    for query in queries {
+        let hits = search_index(&index_dir, &query.query, limit)?;
+        let matched_companies = expected_matches(&query.expected_companies, |expected| {
+            hits.iter()
+                .any(|hit| hit.companies.iter().any(|actual| eq_ci(actual, expected)))
+        });
+        let matched_topics = expected_matches(&query.expected_topics, |expected| {
+            hits.iter()
+                .any(|hit| hit.topics.iter().any(|actual| eq_ci(actual, expected)))
+        });
+        let matched_domains = expected_matches(&query.expected_domains, |expected| {
+            hits.iter().any(|hit| {
+                hit.domain
+                    .as_deref()
+                    .is_some_and(|actual| eq_ci(actual, expected))
+            })
+        });
+        let top_titles: Vec<String> = hits.iter().take(3).map(|hit| hit.title.clone()).collect();
+        let matched = !hits.is_empty()
+            && all_or_empty(&query.expected_companies, &matched_companies)
+            && all_or_empty(&query.expected_topics, &matched_topics)
+            && all_or_empty(&query.expected_domains, &matched_domains);
+
+        if !matched {
+            failures.push(EvalFailure {
+                id: query.id.clone(),
+                query: query.query.clone(),
+                reason: failure_reason(
+                    &query,
+                    hits.len(),
+                    &matched_companies,
+                    &matched_topics,
+                    &matched_domains,
+                ),
+                expected_companies: query.expected_companies.clone(),
+                expected_topics: query.expected_topics.clone(),
+                expected_domains: query.expected_domains.clone(),
+                top_titles: top_titles.clone(),
+            });
+        }
+
+        results.push(EvalQueryResult {
+            id: query.id,
+            query: query.query,
+            matched,
+            result_count: hits.len(),
+            top_titles,
+            matched_companies,
+            matched_topics,
+            matched_domains,
+        });
+    }
+
+    let query_count = results.len();
+    let passed = results.iter().filter(|result| result.matched).count();
+    let failed = query_count.saturating_sub(passed);
+    let recall_like_filter_match = if query_count == 0 {
+        0.0
+    } else {
+        passed as f32 / query_count as f32
+    };
+
+    Ok(EvalReport {
+        query_count,
+        passed,
+        failed,
+        recall_like_filter_match,
+        results,
+        failures,
+    })
+}
+
 pub fn search_index_with_filters(
     index_dir: impl AsRef<Path>,
     query_text: &str,
@@ -1346,6 +1475,68 @@ fn vector_search(
 ) -> Result<Vec<VectorHit>> {
     let query_embedding = embed_text(query_text);
     vector_index_from_env(index_dir).search(&query_embedding, filters, limit)
+}
+
+fn expected_matches<F>(expected: &[String], mut predicate: F) -> Vec<String>
+where
+    F: FnMut(&str) -> bool,
+{
+    expected
+        .iter()
+        .filter(|value| predicate(value))
+        .cloned()
+        .collect()
+}
+
+fn all_or_empty(expected: &[String], matched: &[String]) -> bool {
+    expected.is_empty() || matched.len() == expected.len()
+}
+
+fn failure_reason(
+    query: &EvalQuery,
+    result_count: usize,
+    matched_companies: &[String],
+    matched_topics: &[String],
+    matched_domains: &[String],
+) -> String {
+    if result_count == 0 {
+        return "no results returned".to_string();
+    }
+    let mut missing = Vec::new();
+    append_missing(
+        "companies",
+        &query.expected_companies,
+        matched_companies,
+        &mut missing,
+    );
+    append_missing(
+        "topics",
+        &query.expected_topics,
+        matched_topics,
+        &mut missing,
+    );
+    append_missing(
+        "domains",
+        &query.expected_domains,
+        matched_domains,
+        &mut missing,
+    );
+    if missing.is_empty() {
+        "results returned but did not satisfy expectations".to_string()
+    } else {
+        format!("missing expected {}", missing.join(", "))
+    }
+}
+
+fn append_missing(label: &str, expected: &[String], matched: &[String], out: &mut Vec<String>) {
+    let missing: Vec<&str> = expected
+        .iter()
+        .filter(|value| !matched.iter().any(|hit| eq_ci(hit, value)))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        out.push(format!("{label}=[{}]", missing.join("|")));
+    }
 }
 
 fn normalize(score: f32, max_score: f32) -> f32 {

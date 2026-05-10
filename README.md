@@ -56,6 +56,8 @@ SEMI_SEARCH_EMBEDDING_API_BASE=http://localhost:8000/v1 \
   --provider openai-compatible --model text-embedding-3-small --dimensions 1536
 cargo run -- index --chunks data/chunks.jsonl --index data/index
 cargo run -- search --index data/index --query "GB200 interconnect bandwidth inference" --company NVIDIA --topic networking --limit 3
+cargo run -- eval --queries eval/queries.semiconductors.jsonl --index data/index --limit 5
+cargo run -- compare --index data/index --query "Blackwell vs MI300 AI training economics" --limit 5
 ```
 
 A bounded semiconductor corpus config is included for real sources:
@@ -88,7 +90,39 @@ What works today:
 - hybrid BM25 + vector search with merge/dedup/rerank
 - metadata filters for company, source type, domain, date, and topic
 - cited JSON search results with title, URL, snippet, score, source, metadata, and score components
-- integration tests covering crawl → embed → index → filtered hybrid search
+- `eval` CLI for golden-style semiconductor query JSONL with recall-like filter matching, result counts, top titles, and failure details
+- `compare` CLI that prints Semi Search result JSON beside a no-network placeholder/web-baseline shape
+- integration tests covering crawl → embed → index → filtered hybrid search and eval/compare commands
+
+## Evaluation harness
+
+Semi Search includes a small golden-style evaluation set at:
+
+```text
+eval/queries.semiconductors.jsonl
+```
+
+Each JSONL row has a query plus optional expected companies, topics, and source domains. The harness runs local search only and reports:
+
+- `recall_like_filter_match`: share of queries whose top-k results satisfy all provided expected filters
+- per-query `result_count`
+- per-query `top_titles`
+- matched companies/topics/domains
+- failure records with missing expectations
+
+Run it after building an index:
+
+```bash
+cargo run -- eval --queries eval/queries.semiconductors.jsonl --index data/index --limit 5
+```
+
+For side-by-side agent debugging without external network calls:
+
+```bash
+cargo run -- compare --index data/index --query "TSMC CoWoS capacity constraints" --limit 5
+```
+
+`compare` returns Semi Search results and a `web-baseline-placeholder` block so callers can plug in a real baseline later without changing the response shape.
 
 
 ## Embedding providers

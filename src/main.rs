@@ -24,8 +24,10 @@ enum Command {
     Index(IndexCommand),
     /// Search a local hybrid BM25/vector index and emit cited JSON results.
     Search(SearchCommand),
-    /// Run retrieval quality evaluations. Reserved for golden-query harness.
-    Eval(PathCommand),
+    /// Run retrieval quality evaluations over golden-style query JSONL.
+    Eval(EvalCommand),
+    /// Print Semi Search JSON beside a placeholder/web-baseline-shaped response.
+    Compare(CompareCommand),
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +107,35 @@ struct SearchCommand {
     topic: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct EvalCommand {
+    /// Golden query JSONL. Each line has query plus optional expected companies/topics/domains.
+    #[arg(long)]
+    queries: PathBuf,
+    /// Local index directory created by `semi-search index`.
+    #[arg(long, default_value = "data/index")]
+    index: PathBuf,
+    /// Maximum number of results to evaluate per query.
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct CompareCommand {
+    /// Local index directory created by `semi-search index`.
+    #[arg(long, default_value = "data/index")]
+    index: PathBuf,
+    /// Query text.
+    #[arg(long)]
+    query: String,
+    /// Maximum number of Semi Search results to return.
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+    /// Optional label for the placeholder baseline block.
+    #[arg(long, default_value = "web-baseline-placeholder")]
+    baseline: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -152,7 +183,29 @@ fn main() -> Result<()> {
             println!("indexed_chunks={count}");
             Ok(())
         }
-        Command::Eval(args) => stub_stage("eval", args.data_dir),
+        Command::Eval(args) => {
+            let report = semi_search::evaluate_queries(args.queries, args.index, args.limit)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::Compare(args) => {
+            let results = semi_search::search_index(args.index, &args.query, args.limit)?;
+            let output = serde_json::json!({
+                "query": args.query,
+                "semi_search": {
+                    "result_count": results.len(),
+                    "results": results,
+                },
+                "baseline": {
+                    "kind": args.baseline,
+                    "note": "Placeholder shape only; no external network call is made.",
+                    "result_count": 0,
+                    "results": [],
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
         Command::Search(args) => {
             let filters = semi_search::SearchFilters {
                 company: args.company,

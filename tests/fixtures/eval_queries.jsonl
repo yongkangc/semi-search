@@ -1,0 +1,2 @@
+{"id":"blackwell-networking","query":"GB200 interconnect bandwidth inference","expected_companies":["NVIDIA"],"expected_topics":["ai-accelerators","networking"],"expected_domains":["example.com"]}
+{"id":"tsmc-packaging","query":"TSMC CoWoS advanced packaging capacity","expected_companies":["TSMC"],"expected_topics":["advanced-packaging"],"expected_domains":["example.com"]}
