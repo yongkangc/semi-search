@@ -10,6 +10,8 @@ Initial target corpus:
 - AMD
 - TSMC
 - SemiAnalysis
+- SemiVision Substack
+- Irrational Analysis Substack
 - Semiconductor news, blogs, architecture notes, and investment research sources
 
 ## Product goal
@@ -40,7 +42,7 @@ This is not just a vector database. It is a full retrieval system:
 
 The first prototype should be deliberately small and useful:
 
-- crawl or ingest a small curated set of semiconductor URLs
+- crawl or ingest a small curated set of semiconductor URLs, with autodiscovery from sitemaps, RSS feeds, and internal links
 - parse HTML and Markdown documents
 - chunk documents into source-backed passages
 - index chunks with keyword search and vector embeddings
@@ -80,7 +82,7 @@ Agent context builder
 
 ## Core systems
 
-- Crawler and source connectors
+- Crawler and source connectors, including sitemap/RSS/link autodiscovery
 - Document processing pipeline
 - Chunking and metadata extraction
 - Storage for raw docs, cleaned docs, chunks, and crawl state
