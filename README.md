@@ -50,6 +50,10 @@ The repo now has a runnable local prototype:
 ```bash
 cargo run -- crawl --config configs/seeds.example.toml
 cargo run -- embed --chunks data/chunks.jsonl --out data/embedded_chunks.jsonl
+# Optional OpenAI-compatible embeddings (requires a reachable API base; API key optional for local test servers)
+SEMI_SEARCH_EMBEDDING_API_BASE=http://localhost:8000/v1 \
+  cargo run -- embed --chunks data/chunks.jsonl --out data/embedded_chunks.jsonl \
+  --provider openai-compatible --model text-embedding-3-small --dimensions 1536
 cargo run -- index --chunks data/chunks.jsonl --index data/index
 cargo run -- search --index data/index --query "GB200 interconnect bandwidth inference" --company NVIDIA --topic networking --limit 3
 ```
@@ -77,12 +81,39 @@ What works today:
 - overlapping word chunks with source metadata
 - JSONL chunk output
 - deterministic local embedding generation for offline/e2e development
+- embedding provider abstraction with local and OpenAI-compatible HTTP providers
+- embedding metadata stored per embedded chunk: provider, model, version, dimensions, and method
 - Tantivy/BM25 indexing
 - local vector store written beside the Tantivy index
 - hybrid BM25 + vector search with merge/dedup/rerank
 - metadata filters for company, source type, domain, date, and topic
 - cited JSON search results with title, URL, snippet, score, source, metadata, and score components
 - integration tests covering crawl → embed → index → filtered hybrid search
+
+
+## Embedding providers
+
+`semi-search embed` defaults to deterministic local embeddings so tests and local development do not need a network or API key:
+
+```bash
+cargo run -- embed --chunks data/chunks.jsonl --out data/embedded_chunks.jsonl \
+  --provider local --dimensions 128
+```
+
+Provider options:
+
+- `--provider local` — local hash/BOW embedding provider, deterministic and offline. Default model: `local-hash-bow-v1`.
+- `--provider openai-compatible` — sends requests to an OpenAI-compatible `/embeddings` HTTP endpoint.
+
+OpenAI-compatible configuration:
+
+- `SEMI_SEARCH_EMBEDDING_API_BASE` — API base, default `https://api.openai.com/v1`
+- `SEMI_SEARCH_EMBEDDING_API_KEY` — bearer token, optional so local test servers can run without a key
+- `SEMI_SEARCH_EMBEDDING_MODEL` — model fallback when `--model` is omitted
+- `--model` — overrides the model/env value
+- `--dimensions` — requested/stored embedding dimension count
+
+Each embedded JSONL row includes `embedding_model.provider`, `embedding_model.model`, and `embedding_model.dimensions` for re-embedding/reproducibility.
 
 ## Build order
 

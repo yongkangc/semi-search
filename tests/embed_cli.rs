@@ -32,6 +32,7 @@ fn embed_command_writes_deterministic_embedded_jsonl() {
     let row: Value = serde_json::from_str(&first).expect("valid json");
     assert_eq!(row["chunk_id"], "nvda-blackwell-001");
     assert_eq!(row["embedding"].as_array().expect("embedding").len(), 32);
+    assert_eq!(row["embedding_model"]["provider"], "local");
     assert_eq!(row["embedding_model"]["model"], "local-hash-bow-v1");
     assert_eq!(row["embedding_model"]["dimensions"], 32);
 
@@ -53,4 +54,44 @@ fn embed_command_writes_deterministic_embedded_jsonl() {
         std::fs::read_to_string(&out2).expect("second run"),
         "embedding output should be deterministic"
     );
+}
+
+#[test]
+fn embed_command_accepts_local_provider_and_model_metadata() {
+    let temp = TempDir::new().expect("temp dir");
+    let out = temp.path().join("embedded-custom.jsonl");
+
+    Command::cargo_bin("semi-search")
+        .expect("binary")
+        .args([
+            "embed",
+            "--chunks",
+            "tests/fixtures/semiconductor_chunks.jsonl",
+            "--out",
+        ])
+        .arg(&out)
+        .args([
+            "--provider",
+            "local",
+            "--model",
+            "local-test-model",
+            "--dimensions",
+            "16",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("provider=local"))
+        .stdout(predicate::str::contains("model=local-test-model"));
+
+    let first = std::fs::read_to_string(&out)
+        .expect("embedded output")
+        .lines()
+        .next()
+        .expect("first jsonl row")
+        .to_string();
+    let row: Value = serde_json::from_str(&first).expect("valid json");
+    assert_eq!(row["embedding"].as_array().expect("embedding").len(), 16);
+    assert_eq!(row["embedding_model"]["provider"], "local");
+    assert_eq!(row["embedding_model"]["model"], "local-test-model");
+    assert_eq!(row["embedding_model"]["dimensions"], 16);
 }

@@ -5,6 +5,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,13 @@ const FIELD_TOPICS: &str = "topics";
 const VECTOR_STORE_FILE: &str = "chunks.vector.json";
 pub const EMBEDDING_DIMS: usize = 128;
 pub const LOCAL_HASH_EMBEDDING_MODEL: &str = "local-hash-bow-v1";
+pub const LOCAL_HASH_EMBEDDING_PROVIDER: &str = "local";
+pub const OPENAI_COMPATIBLE_EMBEDDING_PROVIDER: &str = "openai-compatible";
+pub const DEFAULT_OPENAI_COMPATIBLE_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
+const OPENAI_COMPATIBLE_API_BASE_ENV: &str = "SEMI_SEARCH_EMBEDDING_API_BASE";
+const OPENAI_COMPATIBLE_API_KEY_ENV: &str = "SEMI_SEARCH_EMBEDDING_API_KEY";
+const OPENAI_COMPATIBLE_MODEL_ENV: &str = "SEMI_SEARCH_EMBEDDING_MODEL";
 
 /// Source document after crawl/ingest and before chunking.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -117,10 +125,164 @@ struct VectorRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EmbeddingModelMetadata {
+    pub provider: String,
     pub model: String,
     pub version: String,
     pub dimensions: usize,
     pub method: String,
+}
+
+pub trait EmbeddingProvider {
+    fn metadata(&self) -> EmbeddingModelMetadata;
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalHashEmbeddingProvider {
+    model: String,
+    dimensions: usize,
+}
+
+impl LocalHashEmbeddingProvider {
+    pub fn new(dimensions: usize) -> Result<Self> {
+        Self::with_model(LOCAL_HASH_EMBEDDING_MODEL, dimensions)
+    }
+
+    pub fn with_model(model: impl Into<String>, dimensions: usize) -> Result<Self> {
+        validate_embedding_dimensions(dimensions)?;
+        Ok(Self {
+            model: model.into(),
+            dimensions,
+        })
+    }
+}
+
+impl EmbeddingProvider for LocalHashEmbeddingProvider {
+    fn metadata(&self) -> EmbeddingModelMetadata {
+        EmbeddingModelMetadata {
+            provider: LOCAL_HASH_EMBEDDING_PROVIDER.to_string(),
+            model: self.model.clone(),
+            version: "2026-05-10".to_string(),
+            dimensions: self.dimensions,
+            method: "deterministic local semantic hashing; L2 normalized".to_string(),
+        }
+    }
+
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(embed_text_with_dimensions(text, self.dimensions))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAICompatibleEmbeddingProvider {
+    api_base: String,
+    api_key: Option<String>,
+    model: String,
+    dimensions: usize,
+}
+
+impl OpenAICompatibleEmbeddingProvider {
+    pub fn from_env(model: Option<String>, dimensions: usize) -> Result<Self> {
+        validate_embedding_dimensions(dimensions)?;
+        let api_base = env::var(OPENAI_COMPATIBLE_API_BASE_ENV)
+            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let api_key = env::var(OPENAI_COMPATIBLE_API_KEY_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let model = model
+            .or_else(|| env::var(OPENAI_COMPATIBLE_MODEL_ENV).ok())
+            .unwrap_or_else(|| DEFAULT_OPENAI_COMPATIBLE_EMBEDDING_MODEL.to_string());
+
+        Ok(Self {
+            api_base,
+            api_key,
+            model,
+            dimensions,
+        })
+    }
+
+    pub fn new(
+        api_base: impl Into<String>,
+        api_key: Option<String>,
+        model: impl Into<String>,
+        dimensions: usize,
+    ) -> Result<Self> {
+        validate_embedding_dimensions(dimensions)?;
+        Ok(Self {
+            api_base: api_base.into(),
+            api_key,
+            model: model.into(),
+            dimensions,
+        })
+    }
+
+    fn embeddings_url(&self) -> String {
+        format!("{}/embeddings", self.api_base.trim_end_matches('/'))
+    }
+}
+
+impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
+    fn metadata(&self) -> EmbeddingModelMetadata {
+        EmbeddingModelMetadata {
+            provider: OPENAI_COMPATIBLE_EMBEDDING_PROVIDER.to_string(),
+            model: self.model.clone(),
+            version: "openai-compatible-v1".to_string(),
+            dimensions: self.dimensions,
+            method: "OpenAI-compatible HTTP /embeddings response".to_string(),
+        }
+    }
+
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        #[derive(Serialize)]
+        struct EmbeddingRequest<'a> {
+            model: &'a str,
+            input: &'a str,
+            dimensions: usize,
+        }
+
+        #[derive(Deserialize)]
+        struct EmbeddingResponse {
+            data: Vec<EmbeddingDatum>,
+        }
+
+        #[derive(Deserialize)]
+        struct EmbeddingDatum {
+            embedding: Vec<f32>,
+        }
+
+        let client = reqwest::blocking::Client::new();
+        let mut request = client.post(self.embeddings_url()).json(&EmbeddingRequest {
+            model: &self.model,
+            input: text,
+            dimensions: self.dimensions,
+        });
+        if let Some(api_key) = &self.api_key {
+            request = request.bearer_auth(api_key);
+        }
+
+        let response = request
+            .send()
+            .context("request OpenAI-compatible embeddings")?
+            .error_for_status()
+            .context("OpenAI-compatible embeddings HTTP error")?;
+        let response: EmbeddingResponse = response
+            .json()
+            .context("parse OpenAI-compatible embeddings response")?;
+        let embedding = response
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("OpenAI-compatible embeddings response had no data"))?
+            .embedding;
+        if embedding.len() != self.dimensions {
+            return Err(anyhow!(
+                "embedding dimensions mismatch: expected {}, got {}",
+                self.dimensions,
+                embedding.len()
+            ));
+        }
+        Ok(embedding)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -523,36 +685,41 @@ pub fn embed_chunks_file(
     out_path: impl AsRef<Path>,
     dimensions: usize,
 ) -> Result<usize> {
-    if dimensions == 0 {
-        return Err(anyhow!("embedding dimensions must be > 0"));
-    }
+    let provider = LocalHashEmbeddingProvider::new(dimensions)?;
+    embed_chunks_file_with_provider(chunks_path, out_path, &provider)
+}
+
+pub fn embed_chunks_file_with_provider(
+    chunks_path: impl AsRef<Path>,
+    out_path: impl AsRef<Path>,
+    provider: &dyn EmbeddingProvider,
+) -> Result<usize> {
     let chunks: Vec<Chunk> = storage::read_jsonl(chunks_path)?;
-    let metadata = EmbeddingModelMetadata {
-        model: LOCAL_HASH_EMBEDDING_MODEL.to_string(),
-        version: "2026-05-10".to_string(),
-        dimensions,
-        method: "deterministic local semantic hashing; L2 normalized".to_string(),
-    };
-    let embedded: Vec<EmbeddedChunk> = chunks
-        .into_iter()
-        .map(|chunk| {
-            let embedding_text = format!(
-                "{} {} {} {} {}",
-                chunk.title,
-                chunk.source,
-                chunk.companies.join(" "),
-                chunk.topics.join(" "),
-                chunk.text
-            );
-            EmbeddedChunk {
-                embedding: embed_text_with_dimensions(&embedding_text, dimensions),
-                chunk,
-                embedding_model: metadata.clone(),
-            }
-        })
-        .collect();
+    let metadata = provider.metadata();
+    let mut embedded = Vec::with_capacity(chunks.len());
+
+    for chunk in chunks {
+        let embedding_text = chunk_embedding_text(&chunk);
+        embedded.push(EmbeddedChunk {
+            embedding: provider.embed_text(&embedding_text)?,
+            chunk,
+            embedding_model: metadata.clone(),
+        });
+    }
+
     storage::write_jsonl(out_path, &embedded)?;
     Ok(embedded.len())
+}
+
+fn chunk_embedding_text(chunk: &Chunk) -> String {
+    format!(
+        "{} {} {} {} {}",
+        chunk.title,
+        chunk.source,
+        chunk.companies.join(" "),
+        chunk.topics.join(" "),
+        chunk.text
+    )
 }
 
 pub fn index_chunks(chunks_path: impl AsRef<Path>, index_dir: impl AsRef<Path>) -> Result<usize> {
@@ -828,6 +995,13 @@ fn normalize(score: f32, max_score: f32) -> f32 {
     } else {
         (score / max_score).clamp(0.0, 1.0)
     }
+}
+
+fn validate_embedding_dimensions(dimensions: usize) -> Result<()> {
+    if dimensions == 0 {
+        return Err(anyhow!("embedding dimensions must be > 0"));
+    }
+    Ok(())
 }
 
 fn embed_text(text: &str) -> Vec<f32> {
@@ -1540,6 +1714,34 @@ mod tests {
         assert_eq!(chunks[1].text, "three four five");
         assert_eq!(chunks[2].metadata.token_start, 4);
         assert_eq!(chunks[2].metadata.token_end, 7);
+    }
+
+    #[test]
+    fn local_hash_provider_metadata_and_embeddings_are_deterministic() {
+        let provider = LocalHashEmbeddingProvider::with_model("local-test", 8).unwrap();
+        let metadata = provider.metadata();
+        assert_eq!(metadata.provider, "local");
+        assert_eq!(metadata.model, "local-test");
+        assert_eq!(metadata.dimensions, 8);
+        assert_eq!(
+            provider.embed_text("NVIDIA Blackwell GPU").unwrap(),
+            provider.embed_text("NVIDIA Blackwell GPU").unwrap()
+        );
+    }
+
+    #[test]
+    fn openai_compatible_provider_metadata_does_not_require_api_key() {
+        let provider = OpenAICompatibleEmbeddingProvider::new(
+            "http://127.0.0.1:9/v1",
+            None,
+            "test-embedding-model",
+            12,
+        )
+        .unwrap();
+        let metadata = provider.metadata();
+        assert_eq!(metadata.provider, "openai-compatible");
+        assert_eq!(metadata.model, "test-embedding-model");
+        assert_eq!(metadata.dimensions, 12);
     }
 
     #[test]

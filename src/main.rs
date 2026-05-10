@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -18,7 +18,7 @@ enum Command {
     Parse(PathCommand),
     /// Chunk cleaned documents into source-backed passages. Reserved for later pipeline split.
     Chunk(PathCommand),
-    /// Generate deterministic local embeddings for chunk JSONL.
+    /// Generate embeddings for chunk JSONL. Defaults to deterministic local embeddings.
     Embed(EmbedCommand),
     /// Build a local BM25/Tantivy + local vector index from chunk JSONL.
     Index(IndexCommand),
@@ -50,9 +50,21 @@ struct EmbedCommand {
     /// Output embedded chunk JSONL.
     #[arg(long)]
     out: PathBuf,
-    /// Embedding vector dimensions for the local deterministic model.
+    /// Embedding provider to use. Local is deterministic and requires no network.
+    #[arg(long, value_enum, default_value_t = EmbeddingProviderArg::Local)]
+    provider: EmbeddingProviderArg,
+    /// Embedding model name to request/store. Defaults depend on provider/env.
+    #[arg(long)]
+    model: Option<String>,
+    /// Embedding vector dimensions.
     #[arg(long, default_value_t = semi_search::EMBEDDING_DIMS)]
     dimensions: usize,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EmbeddingProviderArg {
+    Local,
+    OpenaiCompatible,
 }
 
 #[derive(Debug, Args)]
@@ -110,11 +122,28 @@ fn main() -> Result<()> {
         Command::Parse(args) => stub_stage("parse", args.data_dir),
         Command::Chunk(args) => stub_stage("chunk", args.data_dir),
         Command::Embed(args) => {
-            let count = semi_search::embed_chunks_file(args.chunks, args.out, args.dimensions)?;
+            let provider: Box<dyn semi_search::EmbeddingProvider> = match args.provider {
+                EmbeddingProviderArg::Local => {
+                    Box::new(semi_search::LocalHashEmbeddingProvider::with_model(
+                        args.model
+                            .as_deref()
+                            .unwrap_or(semi_search::LOCAL_HASH_EMBEDDING_MODEL),
+                        args.dimensions,
+                    )?)
+                }
+                EmbeddingProviderArg::OpenaiCompatible => {
+                    Box::new(semi_search::OpenAICompatibleEmbeddingProvider::from_env(
+                        args.model.clone(),
+                        args.dimensions,
+                    )?)
+                }
+            };
+            let metadata = provider.metadata();
+            let count =
+                semi_search::embed_chunks_file_with_provider(args.chunks, args.out, &*provider)?;
             println!(
-                "embedded_chunks={count} model={} dimensions={}",
-                semi_search::LOCAL_HASH_EMBEDDING_MODEL,
-                args.dimensions
+                "embedded_chunks={count} provider={} model={} dimensions={}",
+                metadata.provider, metadata.model, metadata.dimensions
             );
             Ok(())
         }
