@@ -4,8 +4,9 @@ use anyhow::{anyhow, Context, Result};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -18,6 +19,8 @@ const FIELD_TITLE: &str = "title";
 const FIELD_URL: &str = "url";
 const FIELD_SOURCE: &str = "source";
 const FIELD_TEXT: &str = "text";
+const VECTOR_STORE_FILE: &str = "chunks.vector.json";
+const EMBEDDING_DIMS: usize = 128;
 
 /// Source document after crawl/ingest and before chunking.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -49,11 +52,32 @@ pub struct Chunk {
 
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
+    pub chunk_id: String,
     pub title: String,
     pub url: String,
     pub snippet: String,
     pub score: f32,
     pub source: String,
+    pub score_components: ScoreComponents,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ScoreComponents {
+    pub bm25: f32,
+    pub bm25_normalized: f32,
+    pub vector: f32,
+    pub vector_normalized: f32,
+    pub final_score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VectorRecord {
+    chunk_id: String,
+    title: String,
+    url: String,
+    source: String,
+    text: String,
+    embedding: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -312,6 +336,7 @@ pub fn index_chunks(chunks_path: impl AsRef<Path>, index_dir: impl AsRef<Path>) 
         File::open(chunks_path).with_context(|| format!("opening {}", chunks_path.display()))?;
     let reader = BufReader::new(file);
     let mut count = 0usize;
+    let mut vectors = Vec::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading line {}", line_no + 1))?;
@@ -320,6 +345,15 @@ pub fn index_chunks(chunks_path: impl AsRef<Path>, index_dir: impl AsRef<Path>) 
         }
         let chunk: Chunk = serde_json::from_str(&line)
             .with_context(|| format!("parsing JSONL chunk at line {}", line_no + 1))?;
+        let embedding_text = format!("{} {} {}", chunk.title, chunk.source, chunk.text);
+        vectors.push(VectorRecord {
+            chunk_id: chunk.chunk_id.clone(),
+            title: chunk.title.clone(),
+            url: chunk.url.clone(),
+            source: chunk.source.clone(),
+            text: chunk.text.clone(),
+            embedding: embed_text(&embedding_text),
+        });
         writer.add_document(doc!(
             fields.chunk_id => chunk.chunk_id,
             fields.title => chunk.title,
@@ -332,6 +366,7 @@ pub fn index_chunks(chunks_path: impl AsRef<Path>, index_dir: impl AsRef<Path>) 
 
     writer.commit()?;
     writer.wait_merging_threads()?;
+    write_vector_store(index_dir, &vectors)?;
     Ok(count)
 }
 
@@ -356,23 +391,216 @@ pub fn search_index(
         .parse_query(query_text)
         .with_context(|| format!("parsing query {query_text:?}"))?;
 
-    let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
-    let mut results = Vec::with_capacity(top_docs.len());
+    let bm25_limit = limit.saturating_mul(4).max(limit).max(20);
+    let top_docs = searcher.search(&query, &TopDocs::with_limit(bm25_limit))?;
+    let mut candidates: BTreeMap<String, Candidate> = BTreeMap::new();
+
     for (score, address) in top_docs {
         let doc: TantivyDocument = searcher.doc(address)?;
-        let title = stored_text(&doc, fields.title);
-        let url = stored_text(&doc, fields.url);
-        let source = stored_text(&doc, fields.source);
-        let text = stored_text(&doc, fields.text);
-        results.push(SearchResult {
-            title,
-            url,
-            snippet: make_snippet(&text, query_text, 220),
-            score,
-            source,
-        });
+        let candidate = Candidate {
+            chunk_id: stored_text(&doc, fields.chunk_id),
+            title: stored_text(&doc, fields.title),
+            url: stored_text(&doc, fields.url),
+            source: stored_text(&doc, fields.source),
+            text: stored_text(&doc, fields.text),
+            bm25: score,
+            vector: 0.0,
+        };
+        candidates.insert(candidate.chunk_id.clone(), candidate);
     }
+
+    for hit in vector_search(index_dir, query_text, bm25_limit)? {
+        candidates
+            .entry(hit.record.chunk_id.clone())
+            .and_modify(|candidate| candidate.vector = candidate.vector.max(hit.score))
+            .or_insert_with(|| Candidate {
+                chunk_id: hit.record.chunk_id,
+                title: hit.record.title,
+                url: hit.record.url,
+                source: hit.record.source,
+                text: hit.record.text,
+                bm25: 0.0,
+                vector: hit.score,
+            });
+    }
+
+    let max_bm25 = candidates
+        .values()
+        .map(|candidate| candidate.bm25)
+        .fold(0.0_f32, f32::max);
+    let max_vector = candidates
+        .values()
+        .map(|candidate| candidate.vector)
+        .fold(0.0_f32, f32::max);
+
+    let mut results: Vec<SearchResult> = candidates
+        .into_values()
+        .map(|candidate| {
+            let bm25_normalized = normalize(candidate.bm25, max_bm25);
+            let vector_normalized = normalize(candidate.vector, max_vector);
+            let final_score = (0.65 * bm25_normalized) + (0.35 * vector_normalized);
+            SearchResult {
+                chunk_id: candidate.chunk_id,
+                title: candidate.title,
+                url: candidate.url,
+                snippet: make_snippet(&candidate.text, query_text, 220),
+                score: final_score,
+                source: candidate.source,
+                score_components: ScoreComponents {
+                    bm25: candidate.bm25,
+                    bm25_normalized,
+                    vector: candidate.vector,
+                    vector_normalized,
+                    final_score,
+                },
+            }
+        })
+        .collect();
+
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
+    results.truncate(limit);
     Ok(results)
+}
+
+#[derive(Debug)]
+struct Candidate {
+    chunk_id: String,
+    title: String,
+    url: String,
+    source: String,
+    text: String,
+    bm25: f32,
+    vector: f32,
+}
+
+#[derive(Debug)]
+struct VectorHit {
+    record: VectorRecord,
+    score: f32,
+}
+
+fn write_vector_store(index_dir: &Path, vectors: &[VectorRecord]) -> Result<()> {
+    let path = index_dir.join(VECTOR_STORE_FILE);
+    let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    serde_json::to_writer(BufWriter::new(file), vectors)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn vector_search(index_dir: &Path, query_text: &str, limit: usize) -> Result<Vec<VectorHit>> {
+    let path = index_dir.join(VECTOR_STORE_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let records: Vec<VectorRecord> = serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("reading {}", path.display()))?;
+    let query_embedding = embed_text(query_text);
+    let mut hits: Vec<VectorHit> = records
+        .into_iter()
+        .filter_map(|record| {
+            let score = dot(&query_embedding, &record.embedding);
+            (score > 0.0).then_some(VectorHit { record, score })
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.record.chunk_id.cmp(&b.record.chunk_id))
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn normalize(score: f32, max_score: f32) -> f32 {
+    if max_score <= f32::EPSILON {
+        0.0
+    } else {
+        (score / max_score).clamp(0.0, 1.0)
+    }
+}
+
+fn embed_text(text: &str) -> Vec<f32> {
+    let mut vector = vec![0.0; EMBEDDING_DIMS];
+    let mut seen = HashSet::new();
+    for token in semantic_tokens(text) {
+        if token.len() <= 2 || !seen.insert(token.clone()) {
+            continue;
+        }
+        let idx = token_hash(&token) % EMBEDDING_DIMS;
+        vector[idx] += 1.0;
+    }
+    let norm = dot(&vector, &vector).sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
+fn semantic_tokens(text: &str) -> Vec<String> {
+    let aliases = semantic_aliases();
+    tokenize(text)
+        .into_iter()
+        .flat_map(|token| {
+            let mut expanded = vec![token.clone()];
+            if let Some(extra) = aliases.get(token.as_str()) {
+                expanded.extend(extra.iter().map(|term| (*term).to_string()));
+            }
+            expanded
+        })
+        .collect()
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|term| term.len() > 2)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn semantic_aliases() -> HashMap<&'static str, Vec<&'static str>> {
+    HashMap::from([
+        ("accelerator", vec!["gpu", "training", "inference"]),
+        ("accelerators", vec!["gpu", "training", "inference"]),
+        ("gpu", vec!["accelerator", "training", "inference"]),
+        ("gpus", vec!["accelerator", "training", "inference"]),
+        ("hbm", vec!["memory", "bandwidth"]),
+        ("memory", vec!["hbm", "bandwidth"]),
+        ("bandwidth", vec!["hbm", "memory"]),
+        ("nvlink", vec!["networking", "interconnect", "fabric"]),
+        ("networking", vec!["nvlink", "interconnect", "fabric"]),
+        ("interconnect", vec!["nvlink", "networking", "fabric"]),
+        ("blackwell", vec!["gb200", "nvidia", "accelerator"]),
+        ("gb200", vec!["blackwell", "nvidia", "accelerator"]),
+        ("mi300", vec!["amd", "accelerator", "hbm"]),
+        ("chiplet", vec!["package", "advanced", "packaging"]),
+        ("chiplets", vec!["package", "advanced", "packaging"]),
+        ("ai", vec!["training", "inference", "accelerator"]),
+        ("training", vec!["ai", "accelerator", "workload"]),
+        ("inference", vec!["ai", "accelerator", "workload"]),
+        ("economics", vec!["cost", "tco"]),
+        ("cost", vec!["economics", "tco"]),
+    ])
+}
+
+fn token_hash(token: &str) -> usize {
+    let digest = Sha256::digest(token.as_bytes());
+    usize::from_le_bytes(digest[..std::mem::size_of::<usize>()].try_into().unwrap())
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(left, right)| left * right)
+        .sum()
 }
 
 fn build_schema() -> (Schema, Fields) {
