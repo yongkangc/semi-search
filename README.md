@@ -1,8 +1,8 @@
 # semi-search
 
-Semi Search: agent-native search for semiconductor research.
+Semi Search: agent-first search for semiconductor research.
 
-The goal is to build an Exa-style search engine, in Rust, optimized for agents and fundamental investing workflows. Instead of generic web search, this project focuses on retrieving high-signal semiconductor context: company filings, product architecture notes, technical blogs, industry analysis, news, and supply-chain commentary.
+The goal is to build an agent-first search engine, in Rust, optimized for coding agents, research agents, and semiconductor fundamental investing workflows. Instead of generic web search, this project focuses on retrieving high-signal semiconductor context: company filings, product architecture notes, technical blogs, industry analysis, news, and supply-chain commentary.
 
 Initial target corpus:
 
