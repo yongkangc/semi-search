@@ -1,6 +1,7 @@
 pub mod storage;
 
 use anyhow::{anyhow, Context, Result};
+use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,7 @@ const FIELD_DOMAIN: &str = "domain";
 const FIELD_PUBLISHED_AT: &str = "published_at";
 const FIELD_TOPICS: &str = "topics";
 const VECTOR_STORE_FILE: &str = "chunks.vector.json";
+const DEFAULT_QDRANT_COLLECTION: &str = "semi_search_chunks";
 pub const EMBEDDING_DIMS: usize = 128;
 pub const LOCAL_HASH_EMBEDDING_MODEL: &str = "local-hash-bow-v1";
 pub const LOCAL_HASH_EMBEDDING_PROVIDER: &str = "local";
@@ -109,18 +111,18 @@ pub struct SearchFilters {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct VectorRecord {
-    chunk_id: String,
-    title: String,
-    url: String,
-    source: String,
-    text: String,
-    companies: Vec<String>,
-    source_type: Option<String>,
-    domain: Option<String>,
-    published_at: Option<String>,
-    topics: Vec<String>,
-    embedding: Vec<f32>,
+pub struct VectorRecord {
+    pub chunk_id: String,
+    pub title: String,
+    pub url: String,
+    pub source: String,
+    pub text: String,
+    pub companies: Vec<String>,
+    pub source_type: Option<String>,
+    pub domain: Option<String>,
+    pub published_at: Option<String>,
+    pub topics: Vec<String>,
+    pub embedding: Vec<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -722,6 +724,393 @@ fn chunk_embedding_text(chunk: &Chunk) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorBackendKind {
+    Local,
+    Qdrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorBackendConfig {
+    pub kind: VectorBackendKind,
+    pub index_dir: PathBuf,
+    pub qdrant_url: String,
+    pub qdrant_collection: String,
+}
+
+impl VectorBackendConfig {
+    pub fn local(index_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            kind: VectorBackendKind::Local,
+            index_dir: index_dir.into(),
+            qdrant_url: "http://localhost:6333".to_string(),
+            qdrant_collection: DEFAULT_QDRANT_COLLECTION.to_string(),
+        }
+    }
+
+    pub fn qdrant(url: impl Into<String>, collection: impl Into<String>) -> Self {
+        Self {
+            kind: VectorBackendKind::Qdrant,
+            index_dir: PathBuf::new(),
+            qdrant_url: normalize_qdrant_url(&url.into()),
+            qdrant_collection: collection.into(),
+        }
+    }
+
+    pub fn from_env(index_dir: impl Into<PathBuf>) -> Self {
+        let index_dir = index_dir.into();
+        let backend = std::env::var("SEMI_SEARCH_VECTOR_BACKEND")
+            .unwrap_or_else(|_| "local".to_string())
+            .to_lowercase();
+        if backend == "qdrant" {
+            Self {
+                kind: VectorBackendKind::Qdrant,
+                index_dir,
+                qdrant_url: normalize_qdrant_url(
+                    &std::env::var("QDRANT_URL")
+                        .unwrap_or_else(|_| "http://localhost:6333".to_string()),
+                ),
+                qdrant_collection: std::env::var("QDRANT_COLLECTION")
+                    .unwrap_or_else(|_| DEFAULT_QDRANT_COLLECTION.to_string()),
+            }
+        } else {
+            Self::local(index_dir)
+        }
+    }
+}
+
+pub trait VectorIndex {
+    fn upsert_records(&self, records: &[VectorRecord]) -> Result<()>;
+
+    fn upsert_chunks(&self, chunks: &[EmbeddedChunk]) -> Result<()> {
+        let records: Vec<VectorRecord> = chunks.iter().map(VectorRecord::from_embedded).collect();
+        self.upsert_records(&records)
+    }
+
+    fn search(
+        &self,
+        query_embedding: &[f32],
+        filters: &SearchFilters,
+        top_k: usize,
+    ) -> Result<Vec<VectorHit>>;
+}
+
+pub fn vector_index_from_env(index_dir: impl Into<PathBuf>) -> Box<dyn VectorIndex> {
+    let config = VectorBackendConfig::from_env(index_dir);
+    match config.kind {
+        VectorBackendKind::Local => Box::new(LocalVectorIndex::new(config.index_dir)),
+        VectorBackendKind::Qdrant => Box::new(QdrantVectorIndex::new(config)),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalVectorIndex {
+    path: PathBuf,
+}
+
+impl LocalVectorIndex {
+    pub fn new(index_dir: impl AsRef<Path>) -> Self {
+        Self {
+            path: index_dir.as_ref().join(VECTOR_STORE_FILE),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl VectorIndex for LocalVectorIndex {
+    fn upsert_records(&self, records: &[VectorRecord]) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = File::create(&self.path)
+            .with_context(|| format!("creating {}", self.path.display()))?;
+        serde_json::to_writer(BufWriter::new(file), records)
+            .with_context(|| format!("writing {}", self.path.display()))
+    }
+
+    fn search(
+        &self,
+        query_embedding: &[f32],
+        filters: &SearchFilters,
+        top_k: usize,
+    ) -> Result<Vec<VectorHit>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file =
+            File::open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
+        let records: Vec<VectorRecord> = serde_json::from_reader(BufReader::new(file))
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let mut hits: Vec<VectorHit> = records
+            .into_iter()
+            .filter(|record| filters.matches_record(record))
+            .filter_map(|record| {
+                let score = dot(query_embedding, &record.embedding);
+                (score > 0.0).then_some(VectorHit { record, score })
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.record.chunk_id.cmp(&b.record.chunk_id))
+        });
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QdrantVectorIndex {
+    config: VectorBackendConfig,
+    client: Client,
+}
+
+impl QdrantVectorIndex {
+    pub fn new(config: VectorBackendConfig) -> Self {
+        Self {
+            config,
+            client: Client::new(),
+        }
+    }
+
+    pub fn config(&self) -> &VectorBackendConfig {
+        &self.config
+    }
+
+    pub fn collection_url(&self) -> String {
+        format!(
+            "{}/collections/{}",
+            self.config.qdrant_url, self.config.qdrant_collection
+        )
+    }
+
+    pub fn points_url(&self) -> String {
+        format!("{}/points?wait=true", self.collection_url())
+    }
+
+    pub fn search_url(&self) -> String {
+        format!("{}/points/search", self.collection_url())
+    }
+
+    pub fn create_collection_payload(dimensions: usize) -> serde_json::Value {
+        serde_json::json!({
+            "vectors": {
+                "size": dimensions,
+                "distance": "Cosine"
+            }
+        })
+    }
+
+    pub fn upsert_payload(records: &[VectorRecord]) -> serde_json::Value {
+        let points: Vec<serde_json::Value> = records
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "id": point_id_for_chunk(&record.chunk_id),
+                    "vector": record.embedding,
+                    "payload": {
+                        "chunk_id": record.chunk_id,
+                        "title": record.title,
+                        "url": record.url,
+                        "source": record.source,
+                        "text": record.text,
+                        "companies": record.companies,
+                        "source_type": record.source_type,
+                        "domain": record.domain,
+                        "published_at": record.published_at,
+                        "topics": record.topics
+                    }
+                })
+            })
+            .collect();
+        serde_json::json!({ "points": points })
+    }
+
+    pub fn search_payload(
+        query_embedding: &[f32],
+        filters: &SearchFilters,
+        top_k: usize,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "vector": query_embedding,
+            "limit": top_k,
+            "with_payload": true,
+        });
+        if let Some(filter) = qdrant_filter(filters) {
+            payload["filter"] = filter;
+        }
+        payload
+    }
+}
+
+impl VectorIndex for QdrantVectorIndex {
+    fn upsert_records(&self, records: &[VectorRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let dimensions = records[0].embedding.len();
+        self.client
+            .put(self.collection_url())
+            .json(&Self::create_collection_payload(dimensions))
+            .send()
+            .context("create Qdrant collection")?
+            .error_for_status()
+            .context("Qdrant collection create failed")?;
+        self.client
+            .put(self.points_url())
+            .json(&Self::upsert_payload(records))
+            .send()
+            .context("upsert Qdrant points")?
+            .error_for_status()
+            .context("Qdrant point upsert failed")?;
+        Ok(())
+    }
+
+    fn search(
+        &self,
+        query_embedding: &[f32],
+        filters: &SearchFilters,
+        top_k: usize,
+    ) -> Result<Vec<VectorHit>> {
+        let response: serde_json::Value = self
+            .client
+            .post(self.search_url())
+            .json(&Self::search_payload(query_embedding, filters, top_k))
+            .send()
+            .context("search Qdrant points")?
+            .error_for_status()
+            .context("Qdrant search failed")?
+            .json()
+            .context("parse Qdrant search response")?;
+        let results = response
+            .get("result")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        results
+            .into_iter()
+            .map(qdrant_hit_from_value)
+            .collect::<Result<Vec<_>>>()
+    }
+}
+
+impl VectorRecord {
+    fn from_embedded(embedded: &EmbeddedChunk) -> Self {
+        let indexed = IndexedChunk::from_chunk(embedded.chunk.clone());
+        Self {
+            chunk_id: indexed.chunk_id,
+            title: indexed.title,
+            url: indexed.url,
+            source: indexed.source,
+            text: indexed.text,
+            companies: indexed.companies,
+            source_type: indexed.source_type,
+            domain: indexed.domain,
+            published_at: indexed.published_at,
+            topics: indexed.topics,
+            embedding: embedded.embedding.clone(),
+        }
+    }
+}
+
+fn qdrant_hit_from_value(value: serde_json::Value) -> Result<VectorHit> {
+    let score = value
+        .get("score")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let payload = value
+        .get("payload")
+        .ok_or_else(|| anyhow!("Qdrant hit missing payload"))?;
+    let record = VectorRecord {
+        chunk_id: json_string(payload, "chunk_id"),
+        title: json_string(payload, "title"),
+        url: json_string(payload, "url"),
+        source: json_string(payload, "source"),
+        text: json_string(payload, "text"),
+        companies: json_string_array(payload, "companies"),
+        source_type: json_optional_string(payload, "source_type"),
+        domain: json_optional_string(payload, "domain"),
+        published_at: json_optional_string(payload, "published_at"),
+        topics: json_string_array(payload, "topics"),
+        embedding: Vec::new(),
+    };
+    Ok(VectorHit { record, score })
+}
+
+fn json_string(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn json_optional_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn json_string_array(payload: &serde_json::Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn qdrant_filter(filters: &SearchFilters) -> Option<serde_json::Value> {
+    let mut must = Vec::new();
+    if let Some(company) = &filters.company {
+        must.push(qdrant_match("companies", company));
+    }
+    if let Some(source_type) = &filters.source_type {
+        must.push(qdrant_match("source_type", source_type));
+    }
+    if let Some(domain) = &filters.domain {
+        must.push(qdrant_match("domain", domain));
+    }
+    if let Some(topic) = &filters.topic {
+        must.push(qdrant_match("topics", topic));
+    }
+    if let Some(after) = &filters.after {
+        must.push(serde_json::json!({
+            "key": "published_at",
+            "range": { "gte": after }
+        }));
+    }
+    (!must.is_empty()).then_some(serde_json::json!({ "must": must }))
+}
+
+fn qdrant_match(key: &str, value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "key": key,
+        "match": { "value": value }
+    })
+}
+
+fn point_id_for_chunk(chunk_id: &str) -> u64 {
+    let digest = Sha256::digest(chunk_id.as_bytes());
+    u64::from_le_bytes(digest[..std::mem::size_of::<u64>()].try_into().unwrap())
+}
+
+fn normalize_qdrant_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
 pub fn index_chunks(chunks_path: impl AsRef<Path>, index_dir: impl AsRef<Path>) -> Result<usize> {
     let chunks_path = chunks_path.as_ref();
     let index_dir = index_dir.as_ref();
@@ -789,7 +1178,7 @@ pub fn index_chunks(chunks_path: impl AsRef<Path>, index_dir: impl AsRef<Path>) 
 
     writer.commit()?;
     writer.wait_merging_threads()?;
-    write_vector_store(index_dir, &vectors)?;
+    vector_index_from_env(index_dir).upsert_records(&vectors)?;
     Ok(count)
 }
 
@@ -943,17 +1332,10 @@ struct Candidate {
     vector: f32,
 }
 
-#[derive(Debug)]
-struct VectorHit {
-    record: VectorRecord,
-    score: f32,
-}
-
-fn write_vector_store(index_dir: &Path, vectors: &[VectorRecord]) -> Result<()> {
-    let path = index_dir.join(VECTOR_STORE_FILE);
-    let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    serde_json::to_writer(BufWriter::new(file), vectors)
-        .with_context(|| format!("writing {}", path.display()))
+#[derive(Debug, Clone)]
+pub struct VectorHit {
+    pub record: VectorRecord,
+    pub score: f32,
 }
 
 fn vector_search(
@@ -962,31 +1344,8 @@ fn vector_search(
     limit: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<VectorHit>> {
-    let path = index_dir.join(VECTOR_STORE_FILE);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    let records: Vec<VectorRecord> = serde_json::from_reader(BufReader::new(file))
-        .with_context(|| format!("reading {}", path.display()))?;
     let query_embedding = embed_text(query_text);
-    let mut hits: Vec<VectorHit> = records
-        .into_iter()
-        .filter(|record| filters.matches_record(record))
-        .filter_map(|record| {
-            let score = dot(&query_embedding, &record.embedding);
-            (score > 0.0).then_some(VectorHit { record, score })
-        })
-        .collect();
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.record.chunk_id.cmp(&b.record.chunk_id))
-    });
-    hits.truncate(limit);
-    Ok(hits)
+    vector_index_from_env(index_dir).search(&query_embedding, filters, limit)
 }
 
 fn normalize(score: f32, max_score: f32) -> f32 {
@@ -1714,6 +2073,92 @@ mod tests {
         assert_eq!(chunks[1].text, "three four five");
         assert_eq!(chunks[2].metadata.token_start, 4);
         assert_eq!(chunks[2].metadata.token_end, 7);
+    }
+
+    fn vector_record(id: &str, text: &str) -> VectorRecord {
+        VectorRecord {
+            chunk_id: id.to_string(),
+            title: "NVIDIA Blackwell".to_string(),
+            url: "https://example.com/blackwell".to_string(),
+            source: "Example".to_string(),
+            text: text.to_string(),
+            companies: vec!["NVIDIA".to_string()],
+            source_type: Some("analysis".to_string()),
+            domain: Some("example.com".to_string()),
+            published_at: Some("2026-05-10".to_string()),
+            topics: vec!["networking".to_string()],
+            embedding: embed_text(text),
+        }
+    }
+
+    #[test]
+    fn local_vector_index_round_trips_filtered_search() {
+        let dir = tempdir().unwrap();
+        let index = LocalVectorIndex::new(dir.path());
+        index
+            .upsert_records(&[
+                vector_record("nvda-1", "Blackwell NVLink networking fabric"),
+                vector_record("nvda-2", "HBM memory bandwidth"),
+            ])
+            .unwrap();
+
+        let hits = index
+            .search(
+                &embed_text("NVLink interconnect"),
+                &SearchFilters {
+                    company: Some("NVIDIA".to_string()),
+                    topic: Some("networking".to_string()),
+                    ..SearchFilters::default()
+                },
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.chunk_id, "nvda-1");
+        assert!(hits[0].score > 0.0);
+        assert!(index.path().ends_with(VECTOR_STORE_FILE));
+    }
+
+    #[test]
+    fn qdrant_config_urls_and_payloads_are_constructed_without_server() {
+        let config = VectorBackendConfig::qdrant("http://localhost:6333/", "semi_test");
+        let index = QdrantVectorIndex::new(config.clone());
+        assert_eq!(config.qdrant_url, "http://localhost:6333");
+        assert_eq!(
+            index.collection_url(),
+            "http://localhost:6333/collections/semi_test"
+        );
+        assert_eq!(
+            index.points_url(),
+            "http://localhost:6333/collections/semi_test/points?wait=true"
+        );
+        assert_eq!(
+            index.search_url(),
+            "http://localhost:6333/collections/semi_test/points/search"
+        );
+
+        let record = vector_record("chunk-a", "Blackwell NVLink fabric");
+        let upsert = QdrantVectorIndex::upsert_payload(std::slice::from_ref(&record));
+        assert_eq!(upsert["points"][0]["payload"]["chunk_id"], "chunk-a");
+        assert_eq!(upsert["points"][0]["payload"]["companies"][0], "NVIDIA");
+        assert_eq!(
+            upsert["points"][0]["vector"].as_array().unwrap().len(),
+            EMBEDDING_DIMS
+        );
+
+        let search = QdrantVectorIndex::search_payload(
+            &record.embedding,
+            &SearchFilters {
+                company: Some("NVIDIA".to_string()),
+                domain: Some("example.com".to_string()),
+                after: Some("2026-01-01".to_string()),
+                ..SearchFilters::default()
+            },
+            7,
+        );
+        assert_eq!(search["limit"], 7);
+        assert_eq!(search["filter"]["must"].as_array().unwrap().len(), 3);
     }
 
     #[test]

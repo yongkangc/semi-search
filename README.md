@@ -248,6 +248,39 @@ Then use a proven backend for v1:
 
 Recommendation for now: **Qdrant first**, behind a Rust trait.
 
+#### Qdrant backend (optional)
+
+Local JSON vector storage remains the default; no Docker is needed for tests or the v0 CLI path.
+To exercise the Qdrant backend, start Qdrant and opt in with env vars:
+
+```yaml
+# docker-compose.qdrant.yml
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:
+```
+
+```bash
+docker compose -f docker-compose.qdrant.yml up -d
+SEMI_SEARCH_VECTOR_BACKEND=qdrant \
+  QDRANT_URL=http://localhost:6333 \
+  QDRANT_COLLECTION=semi_search_chunks \
+  cargo run -- index --chunks data/chunks.jsonl --index data/index
+```
+
+Env options:
+
+- `SEMI_SEARCH_VECTOR_BACKEND=local|qdrant` (`local` default)
+- `QDRANT_URL` (default `http://localhost:6333` when Qdrant is selected)
+- `QDRANT_COLLECTION` (default `semi_search_chunks`)
+
 Why:
 
 - good metadata filtering
