@@ -139,6 +139,22 @@ pub struct CrawlConfig {
     pub chunk_tokens: usize,
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: usize,
+    /// Hard stop for all pages fetched by one crawl run. Defaults to one page
+    /// so configs must opt into discovery explicitly.
+    #[serde(default = "default_max_pages")]
+    pub max_pages: usize,
+    /// Follow same-domain links discovered in HTML pages. Disabled by default.
+    #[serde(default)]
+    pub discover_same_domain: bool,
+    /// URL path allow patterns. Simple deterministic globs: `*` wildcard or substring.
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
+    /// URL path deny patterns. Deny wins over allow.
+    #[serde(default)]
+    pub deny_paths: Vec<String>,
+    /// Deterministic URL -> local fixture mapping used before network fetches.
+    #[serde(default)]
+    pub fixture_responses: Vec<FixtureResponse>,
     #[serde(default)]
     pub seeds: Vec<Seed>,
 }
@@ -152,6 +168,26 @@ pub struct Seed {
     pub source: Option<String>,
     #[serde(default)]
     pub fixture_path: Option<PathBuf>,
+    #[serde(default)]
+    pub max_pages: Option<usize>,
+    #[serde(default)]
+    pub discover_same_domain: Option<bool>,
+    /// Optional sitemap URLs to read for bounded candidate discovery.
+    #[serde(default)]
+    pub sitemap_urls: Vec<String>,
+    /// Optional RSS/Atom feed URLs to read for bounded candidate discovery.
+    #[serde(default)]
+    pub rss_urls: Vec<String>,
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
+    #[serde(default)]
+    pub deny_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FixtureResponse {
+    pub url: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -220,6 +256,9 @@ pub fn load_crawl_config(path: impl AsRef<Path>) -> Result<CrawlConfig> {
     if config.chunk_overlap >= config.chunk_tokens {
         return Err(anyhow!("chunk_overlap must be smaller than chunk_tokens"));
     }
+    if config.max_pages == 0 {
+        return Err(anyhow!("max_pages must be > 0"));
+    }
 
     absolutize_config_paths(path.parent().unwrap_or(Path::new(".")), &mut config);
     Ok(config)
@@ -229,46 +268,131 @@ pub fn load_crawl_config(path: impl AsRef<Path>) -> Result<CrawlConfig> {
 /// fixture/local runs over web-scale crawl behavior.
 pub fn crawl_to_chunks(config: &CrawlConfig) -> Result<Vec<ChunkRecord>> {
     let mut chunks = Vec::new();
+    let fixture_map = build_fixture_map(config);
+    let mut visited = BTreeSet::new();
+    let mut fetched_pages = 0usize;
+
     for seed in &config.seeds {
-        let raw = read_seed(seed)?;
-        let document = parse_crawled_document(seed, &raw)?;
-        chunks.extend(chunk_document(
-            &document,
-            config.chunk_tokens,
-            config.chunk_overlap,
-        ));
+        if fetched_pages >= config.max_pages {
+            break;
+        }
+
+        let seed_budget = seed.max_pages.unwrap_or(config.max_pages).max(1);
+        let mut fetched_for_seed = 0usize;
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(seed.url.clone());
+
+        for hint in seed.sitemap_urls.iter().chain(seed.rss_urls.iter()) {
+            if fetched_pages + queue.len() >= config.max_pages {
+                break;
+            }
+            if let Ok(raw) = read_url_with_fixtures(hint, &fixture_map) {
+                for url in extract_feed_urls(&raw) {
+                    if should_visit_url(config, seed, &seed.url, &url) {
+                        queue.push_back(url);
+                    }
+                }
+            }
+        }
+
+        while let Some(url) = queue.pop_front() {
+            if fetched_pages >= config.max_pages || fetched_for_seed >= seed_budget {
+                break;
+            }
+            if !visited.insert(url.clone()) || !should_visit_url(config, seed, &seed.url, &url) {
+                continue;
+            }
+
+            let raw = if url == seed.url {
+                read_seed_with_fixtures(seed, &fixture_map)?
+            } else {
+                read_url_with_fixtures(&url, &fixture_map)?
+            };
+            let page_seed = Seed {
+                url: url.clone(),
+                title: if url == seed.url {
+                    seed.title.clone()
+                } else {
+                    None
+                },
+                source: seed.source.clone(),
+                fixture_path: None,
+                max_pages: None,
+                discover_same_domain: None,
+                sitemap_urls: Vec::new(),
+                rss_urls: Vec::new(),
+                allow_paths: Vec::new(),
+                deny_paths: Vec::new(),
+            };
+            let document = parse_crawled_document(&page_seed, &raw)?;
+            chunks.extend(chunk_document(
+                &document,
+                config.chunk_tokens,
+                config.chunk_overlap,
+            ));
+            fetched_pages += 1;
+            fetched_for_seed += 1;
+
+            let discover_links = seed
+                .discover_same_domain
+                .unwrap_or(config.discover_same_domain);
+            if discover_links && fetched_pages < config.max_pages && fetched_for_seed < seed_budget
+            {
+                for link in extract_same_domain_links(&url, &raw) {
+                    if should_visit_url(config, seed, &seed.url, &link) && !visited.contains(&link)
+                    {
+                        queue.push_back(link);
+                    }
+                }
+            }
+        }
     }
     storage::write_jsonl(&config.output_jsonl, &chunks)?;
     Ok(chunks)
 }
 
 pub fn read_seed(seed: &Seed) -> Result<String> {
+    read_seed_with_fixtures(seed, &HashMap::new())
+}
+
+fn read_seed_with_fixtures(seed: &Seed, fixtures: &HashMap<String, PathBuf>) -> Result<String> {
     if let Some(path) = &seed.fixture_path {
         return fs::read_to_string(path)
             .with_context(|| format!("read fixture {}", path.display()));
     }
+    read_url_with_fixtures(&seed.url, fixtures)
+}
 
-    if let Ok(url) = Url::parse(&seed.url) {
+fn read_url_with_fixtures(
+    url_or_path: &str,
+    fixtures: &HashMap<String, PathBuf>,
+) -> Result<String> {
+    if let Some(path) = fixtures.get(url_or_path) {
+        return fs::read_to_string(path)
+            .with_context(|| format!("read fixture {} for {url_or_path}", path.display()));
+    }
+
+    if let Ok(url) = Url::parse(url_or_path) {
         match url.scheme() {
             "file" => {
                 let path = url
                     .to_file_path()
-                    .map_err(|_| anyhow!("invalid file URL: {}", seed.url))?;
-                fs::read_to_string(&path).with_context(|| format!("read file URL {}", seed.url))
+                    .map_err(|_| anyhow!("invalid file URL: {url_or_path}"))?;
+                fs::read_to_string(&path).with_context(|| format!("read file URL {url_or_path}"))
             }
             "http" | "https" => {
-                let response = reqwest::blocking::get(&seed.url)
-                    .with_context(|| format!("fetch {}", seed.url))?;
+                let response = reqwest::blocking::get(url_or_path)
+                    .with_context(|| format!("fetch {url_or_path}"))?;
                 response
                     .error_for_status()
-                    .with_context(|| format!("HTTP error for {}", seed.url))?
+                    .with_context(|| format!("HTTP error for {url_or_path}"))?
                     .text()
-                    .with_context(|| format!("read HTTP body for {}", seed.url))
+                    .with_context(|| format!("read HTTP body for {url_or_path}"))
             }
             other => Err(anyhow!("unsupported URL scheme: {other}")),
         }
     } else {
-        fs::read_to_string(&seed.url).with_context(|| format!("read path {}", seed.url))
+        fs::read_to_string(url_or_path).with_context(|| format!("read path {url_or_path}"))
     }
 }
 
@@ -1183,9 +1307,140 @@ fn eq_ci(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+fn build_fixture_map(config: &CrawlConfig) -> HashMap<String, PathBuf> {
+    config
+        .fixture_responses
+        .iter()
+        .map(|fixture| (fixture.url.clone(), fixture.path.clone()))
+        .collect()
+}
+
+fn extract_same_domain_links(base_url: &str, raw: &str) -> Vec<String> {
+    let base = match Url::parse(base_url) {
+        Ok(base) => base,
+        Err(_) => return Vec::new(),
+    };
+    let document = Html::parse_document(raw);
+    let selector = match Selector::parse("a[href]") {
+        Ok(selector) => selector,
+        Err(_) => return Vec::new(),
+    };
+    document
+        .select(&selector)
+        .filter_map(|element| element.value().attr("href"))
+        .filter_map(|href| base.join(href).ok())
+        .filter(|url| url.scheme() == base.scheme() && url.domain() == base.domain())
+        .map(normalize_url)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn extract_feed_urls(raw: &str) -> Vec<String> {
+    let mut urls = BTreeSet::new();
+    for tag in ["loc", "link"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut rest = raw;
+        while let Some(start) = rest.find(&open) {
+            let after_open = &rest[start + open.len()..];
+            let Some(end) = after_open.find(&close) else {
+                break;
+            };
+            let candidate = clean_text(&after_open[..end]);
+            if Url::parse(&candidate).is_ok() {
+                urls.insert(candidate);
+            }
+            rest = &after_open[end + close.len()..];
+        }
+    }
+    urls.into_iter().collect()
+}
+
+fn should_visit_url(config: &CrawlConfig, seed: &Seed, seed_url: &str, candidate: &str) -> bool {
+    let Ok(seed_parsed) = Url::parse(seed_url) else {
+        return candidate == seed_url;
+    };
+    let Ok(candidate_parsed) = Url::parse(candidate) else {
+        return false;
+    };
+    if candidate_parsed.domain() != seed_parsed.domain() {
+        return false;
+    }
+    let path = candidate_parsed.path();
+    let allow_patterns: Vec<&str> = config
+        .allow_paths
+        .iter()
+        .chain(seed.allow_paths.iter())
+        .map(String::as_str)
+        .collect();
+    let deny_patterns: Vec<&str> = config
+        .deny_paths
+        .iter()
+        .chain(seed.deny_paths.iter())
+        .map(String::as_str)
+        .collect();
+
+    if deny_patterns
+        .iter()
+        .any(|pattern| path_pattern_matches(pattern, path))
+    {
+        return false;
+    }
+    allow_patterns.is_empty()
+        || allow_patterns
+            .iter()
+            .any(|pattern| path_pattern_matches(pattern, path))
+}
+
+fn path_pattern_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return path.contains(pattern);
+    }
+
+    let mut remaining = path;
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+    let parts: Vec<&str> = pattern.split('*').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return true;
+    }
+    if anchored_start && !path.starts_with(parts[0]) {
+        return false;
+    }
+    for part in &parts {
+        let Some(idx) = remaining.find(part) else {
+            return false;
+        };
+        remaining = &remaining[idx + part.len()..];
+    }
+    if anchored_end {
+        path.ends_with(parts[parts.len() - 1])
+    } else {
+        true
+    }
+}
+
+fn normalize_url(mut url: Url) -> String {
+    url.set_fragment(None);
+    url.to_string()
+}
+
 fn absolutize_config_paths(base: &Path, config: &mut CrawlConfig) {
     if config.output_jsonl.is_relative() {
         config.output_jsonl = base.join(&config.output_jsonl);
+    }
+    for fixture in &mut config.fixture_responses {
+        if fixture.path.is_relative() {
+            fixture.path = base.join(&fixture.path);
+        }
     }
     for seed in &mut config.seeds {
         if let Some(path) = &seed.fixture_path {
@@ -1220,6 +1475,10 @@ fn default_chunk_overlap() -> usize {
     40
 }
 
+fn default_max_pages() -> usize {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,6 +1490,12 @@ mod tests {
             title: None,
             source: Some("Example Semi".to_string()),
             fixture_path: None,
+            max_pages: None,
+            discover_same_domain: None,
+            sitemap_urls: Vec::new(),
+            rss_urls: Vec::new(),
+            allow_paths: Vec::new(),
+            deny_paths: Vec::new(),
         }
     }
 
@@ -1291,11 +1556,22 @@ mod tests {
             output_jsonl: output.clone(),
             chunk_tokens: 6,
             chunk_overlap: 2,
+            max_pages: 1,
+            discover_same_domain: false,
+            allow_paths: Vec::new(),
+            deny_paths: Vec::new(),
+            fixture_responses: Vec::new(),
             seeds: vec![Seed {
                 url: "https://example.com/amd-mi300".to_string(),
                 title: None,
                 source: Some("Fixture".to_string()),
                 fixture_path: Some(fixture),
+                max_pages: None,
+                discover_same_domain: None,
+                sitemap_urls: Vec::new(),
+                rss_urls: Vec::new(),
+                allow_paths: Vec::new(),
+                deny_paths: Vec::new(),
             }],
         };
 

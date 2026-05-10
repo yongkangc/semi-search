@@ -54,9 +54,25 @@ cargo run -- index --chunks data/chunks.jsonl --index data/index
 cargo run -- search --index data/index --query "GB200 interconnect bandwidth inference" --company NVIDIA --topic networking --limit 3
 ```
 
+A bounded semiconductor corpus config is included for real sources:
+
+```bash
+cargo run -- crawl --config configs/seeds.semiconductors.toml
+```
+
+That config seeds NVIDIA, AMD, TSMC, SemiAnalysis, SemiVision Substack, and
+Irrational Analysis Substack. It is intentionally production-shaped but small:
+`max_pages` is a hard stop, discovery stays same-domain, sitemap/RSS URLs are
+only hints, and allow/deny path patterns keep the crawl scoped. Tests use
+`fixture_responses` to map URLs to local files so discovery behavior stays
+deterministic and never depends on live websites.
+
 What works today:
 
 - fixture/local/HTTP seed fetching
+- bounded same-domain link discovery with sitemap/RSS hints
+- global/per-seed `max_pages`, allow path patterns, and deny path patterns
+- deterministic `fixture_responses` fallback for tests and offline crawls
 - basic HTML/plain-text parsing and cleaning
 - overlapping word chunks with source metadata
 - JSONL chunk output

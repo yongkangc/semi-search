@@ -1,0 +1,61 @@
+# Bounded production-shaped semiconductor corpus seed config.
+# This is intentionally not an unbounded crawler: max_pages is the hard stop,
+# discovery is same-domain only, and allow/deny paths keep the crawl on high-signal pages.
+output_jsonl = "../data/semiconductor_chunks.jsonl"
+chunk_tokens = 220
+chunk_overlap = 40
+max_pages = 60
+discover_same_domain = true
+
+deny_paths = [
+  "/login", "/signin", "/account", "/cart", "/checkout", "/privacy", "/terms",
+  "/tag/", "/author/", "/category/", "/page/"
+]
+
+[[seeds]]
+url = "https://www.nvidia.com/en-us/data-center/"
+title = "NVIDIA Data Center"
+source = "NVIDIA"
+max_pages = 10
+allow_paths = ["/en-us/data-center", "/en-us/ai-data-science", "/en-us/networking"]
+sitemap_urls = ["https://www.nvidia.com/sitemap.xml"]
+
+[[seeds]]
+url = "https://www.amd.com/en/products/accelerators.html"
+title = "AMD Accelerators"
+source = "AMD"
+max_pages = 10
+allow_paths = ["/en/products/accelerators", "/en/products/software", "/en/solutions/data-center"]
+sitemap_urls = ["https://www.amd.com/sitemap.xml"]
+
+[[seeds]]
+url = "https://www.tsmc.com/english/dedicatedFoundry/technology"
+title = "TSMC Technology"
+source = "TSMC"
+max_pages = 10
+allow_paths = ["/english/dedicatedFoundry/technology", "/english/dedicatedFoundry/manufacturing", "/english/news"]
+sitemap_urls = ["https://www.tsmc.com/sitemap.xml"]
+
+[[seeds]]
+url = "https://semianalysis.com/"
+title = "SemiAnalysis"
+source = "SemiAnalysis"
+max_pages = 12
+allow_paths = ["/20", "/p/"]
+rss_urls = ["https://semianalysis.com/feed/"]
+
+[[seeds]]
+url = "https://semivision.substack.com/"
+title = "SemiVision Substack"
+source = "SemiVision"
+max_pages = 9
+allow_paths = ["/p/"]
+rss_urls = ["https://semivision.substack.com/feed"]
+
+[[seeds]]
+url = "https://irrationalanalysis.substack.com/"
+title = "Irrational Analysis Substack"
+source = "Irrational Analysis"
+max_pages = 9
+allow_paths = ["/p/"]
+rss_urls = ["https://irrationalanalysis.substack.com/feed"]
