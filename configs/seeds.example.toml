@@ -1,0 +1,17 @@
+# Deterministic local fixture mode for the v0 vertical slice.
+# Run: cargo run -- --config configs/seeds.example.toml
+output_jsonl = "../data/chunks.jsonl"
+chunk_tokens = 70
+chunk_overlap = 12
+
+[[seeds]]
+url = "https://example.com/semiconductor/nvidia-blackwell"
+title = "NVIDIA Blackwell Architecture Notes"
+source = "fixture"
+fixture_path = "../fixtures/nvidia_blackwell.html"
+
+[[seeds]]
+url = "https://example.com/semiconductor/amd-mi300"
+title = "AMD MI300 Product Notes"
+source = "fixture"
+fixture_path = "../fixtures/amd_mi300.txt"

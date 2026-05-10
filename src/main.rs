@@ -12,18 +12,25 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Crawl seed sources into raw documents.
-    Crawl(PathCommand),
-    /// Parse raw documents into cleaned documents.
+    /// Quick crawl seed sources into chunk JSONL.
+    Crawl(CrawlCommand),
+    /// Parse raw documents into cleaned documents. Reserved for later pipeline split.
     Parse(PathCommand),
-    /// Chunk cleaned documents into source-backed passages.
+    /// Chunk cleaned documents into source-backed passages. Reserved for later pipeline split.
     Chunk(PathCommand),
     /// Build a local BM25/Tantivy index from chunk JSONL.
     Index(IndexCommand),
     /// Search a local BM25/Tantivy index and emit cited JSON results.
     Search(SearchCommand),
-    /// Run retrieval quality evaluations.
+    /// Run retrieval quality evaluations. Reserved for golden-query harness.
     Eval(PathCommand),
+}
+
+#[derive(Debug, Args)]
+struct CrawlCommand {
+    /// TOML seed config to run.
+    #[arg(short, long, default_value = "configs/seeds.example.toml")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -35,7 +42,7 @@ struct PathCommand {
 
 #[derive(Debug, Args)]
 struct IndexCommand {
-    /// JSONL file. Each line needs chunk_id, title, url, source, text.
+    /// JSONL file. Each line needs id/chunk_id, title, url, source, text.
     #[arg(long)]
     chunks: PathBuf,
     /// Local index directory to create. Existing contents are replaced.
@@ -60,7 +67,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Crawl(args) => stub_stage("crawl", args.data_dir),
+        Command::Crawl(args) => {
+            let config = semi_search::load_crawl_config(args.config)?;
+            let chunks = semi_search::crawl_to_chunks(&config)?;
+            println!(
+                "wrote_chunks={} output={}",
+                chunks.len(),
+                config.output_jsonl.display()
+            );
+            Ok(())
+        }
         Command::Parse(args) => stub_stage("parse", args.data_dir),
         Command::Chunk(args) => stub_stage("chunk", args.data_dir),
         Command::Index(args) => {

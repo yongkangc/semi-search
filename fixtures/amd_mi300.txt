@@ -1,0 +1,3 @@
+AMD MI300 combines CPU chiplets, GPU chiplets, and HBM into an accelerator family for AI and HPC workloads.
+MI300X focuses on large-memory GPU acceleration while MI300A combines CPU and GPU compute in one package.
+Useful chunks should preserve product name, workload, memory, and packaging context for later retrieval tests.

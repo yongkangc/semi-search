@@ -42,6 +42,27 @@ This is not just a vector database. It is a full retrieval system:
 6. evaluate search quality continuously
 
 
+
+## Current v0 vertical slice
+
+The repo now has a runnable local prototype:
+
+```bash
+cargo run -- crawl --config configs/seeds.example.toml
+cargo run -- index --chunks data/chunks.jsonl --index data/index
+cargo run -- search --index data/index --query "Blackwell MI300 AI training economics" --limit 3
+```
+
+What works today:
+
+- fixture/local/HTTP seed fetching
+- basic HTML/plain-text parsing and cleaning
+- overlapping word chunks with source metadata
+- JSONL chunk output
+- Tantivy/BM25 indexing
+- cited JSON search results with title, URL, snippet, score, and source
+- integration tests covering crawl → index → search
+
 ## Build order
 
 The first milestone is a quick crawler that produces useful chunks, not a full-scale crawler.
