@@ -49,8 +49,9 @@ The repo now has a runnable local prototype:
 
 ```bash
 cargo run -- crawl --config configs/seeds.example.toml
+cargo run -- embed --chunks data/chunks.jsonl --out data/embedded_chunks.jsonl
 cargo run -- index --chunks data/chunks.jsonl --index data/index
-cargo run -- search --index data/index --query "Blackwell MI300 AI training economics" --limit 3
+cargo run -- search --index data/index --query "GB200 interconnect bandwidth inference" --company NVIDIA --topic networking --limit 3
 ```
 
 What works today:
@@ -59,9 +60,13 @@ What works today:
 - basic HTML/plain-text parsing and cleaning
 - overlapping word chunks with source metadata
 - JSONL chunk output
+- deterministic local embedding generation for offline/e2e development
 - Tantivy/BM25 indexing
-- cited JSON search results with title, URL, snippet, score, and source
-- integration tests covering crawl → index → search
+- local vector store written beside the Tantivy index
+- hybrid BM25 + vector search with merge/dedup/rerank
+- metadata filters for company, source type, domain, date, and topic
+- cited JSON search results with title, URL, snippet, score, source, metadata, and score components
+- integration tests covering crawl → embed → index → filtered hybrid search
 
 ## Build order
 
@@ -158,20 +163,18 @@ Current v0 has a thin end-to-end slice:
 Current query path:
 
 ```text
-query -> Tantivy BM25 -> top-k chunks -> JSON cited results
+query -> Tantivy BM25 + local vector search -> merge/dedup -> filters -> rerank -> JSON cited results
 ```
 
 ### What is left
 
 The retrieval core still needs:
 
-- vector embeddings for every chunk
-- vector DB/index for semantic search
-- hybrid retrieval: BM25 + vector search
-- metadata filters: company, source type, domain, date, topic
-- score normalization across BM25 and vector scores
-- candidate merging and deduplication
-- reranking layer
+- production embedding model for every chunk
+- Qdrant/LanceDB backend for semantic search
+- persistent vector index service instead of local JSON vector store
+- richer filters and boolean filter composition
+- stronger reranking layer
 - source-quality and freshness scoring
 - compact query-specific highlights
 - latency benchmarks

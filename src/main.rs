@@ -18,9 +18,11 @@ enum Command {
     Parse(PathCommand),
     /// Chunk cleaned documents into source-backed passages. Reserved for later pipeline split.
     Chunk(PathCommand),
-    /// Build a local BM25/Tantivy index from chunk JSONL.
+    /// Generate deterministic local embeddings for chunk JSONL.
+    Embed(EmbedCommand),
+    /// Build a local BM25/Tantivy + local vector index from chunk JSONL.
     Index(IndexCommand),
-    /// Search a local BM25/Tantivy index and emit cited JSON results.
+    /// Search a local hybrid BM25/vector index and emit cited JSON results.
     Search(SearchCommand),
     /// Run retrieval quality evaluations. Reserved for golden-query harness.
     Eval(PathCommand),
@@ -38,6 +40,19 @@ struct PathCommand {
     /// Local data directory used by this pipeline stage.
     #[arg(long, default_value = "data")]
     data_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct EmbedCommand {
+    /// Input chunk JSONL. Each line needs id/chunk_id, title, url, source, text.
+    #[arg(long)]
+    chunks: PathBuf,
+    /// Output embedded chunk JSONL.
+    #[arg(long)]
+    out: PathBuf,
+    /// Embedding vector dimensions for the local deterministic model.
+    #[arg(long, default_value_t = semi_search::EMBEDDING_DIMS)]
+    dimensions: usize,
 }
 
 #[derive(Debug, Args)]
@@ -61,6 +76,21 @@ struct SearchCommand {
     /// Maximum number of results to return.
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    /// Filter by inferred or provided company tag, e.g. NVIDIA, AMD, TSMC.
+    #[arg(long)]
+    company: Option<String>,
+    /// Filter by source type, e.g. analysis, substack, news, filing.
+    #[arg(long = "source-type")]
+    source_type: Option<String>,
+    /// Filter by URL domain, e.g. semianalysis.com.
+    #[arg(long)]
+    domain: Option<String>,
+    /// Filter to documents published at or after YYYY-MM-DD.
+    #[arg(long)]
+    after: Option<String>,
+    /// Filter by inferred or provided topic tag.
+    #[arg(long)]
+    topic: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -79,6 +109,15 @@ fn main() -> Result<()> {
         }
         Command::Parse(args) => stub_stage("parse", args.data_dir),
         Command::Chunk(args) => stub_stage("chunk", args.data_dir),
+        Command::Embed(args) => {
+            let count = semi_search::embed_chunks_file(args.chunks, args.out, args.dimensions)?;
+            println!(
+                "embedded_chunks={count} model={} dimensions={}",
+                semi_search::LOCAL_HASH_EMBEDDING_MODEL,
+                args.dimensions
+            );
+            Ok(())
+        }
         Command::Index(args) => {
             let count = semi_search::index_chunks(args.chunks, args.index)?;
             println!("indexed_chunks={count}");
@@ -86,7 +125,19 @@ fn main() -> Result<()> {
         }
         Command::Eval(args) => stub_stage("eval", args.data_dir),
         Command::Search(args) => {
-            let results = semi_search::search_index(args.index, &args.query, args.limit)?;
+            let filters = semi_search::SearchFilters {
+                company: args.company,
+                source_type: args.source_type,
+                domain: args.domain,
+                after: args.after,
+                topic: args.topic,
+            };
+            let results = semi_search::search_index_with_filters(
+                args.index,
+                &args.query,
+                args.limit,
+                &filters,
+            )?;
             println!("{}", serde_json::to_string_pretty(&results)?);
             Ok(())
         }
